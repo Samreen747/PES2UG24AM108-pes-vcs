@@ -1,34 +1,44 @@
-```c
+#include "index.h"
+#include "pes.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
-#include "index.h"
-#include "object.h"
-#include "pes.h"
-
-#define INDEX_FILE ".pes/index"
+#include <sys/stat.h>
 
 /*
- * Load index from file
+ * Load index from .pes/index
  */
 int index_load(Index *idx) {
-    if (!idx) return -1;
-
-    FILE *f = fopen(INDEX_FILE, "r");
-    if (!f) {
-        idx->count = 0; // empty index if file doesn't exist
-        return 0;
-    }
+    FILE *f = fopen(".pes/index", "r");
 
     idx->count = 0;
 
-    while (!feof(f)) {
+    if (!f) {
+        // No index file → empty index
+        return 0;
+    }
+
+    while (idx->count < MAX_INDEX_ENTRIES) {
         IndexEntry *e = &idx->entries[idx->count];
 
-        if (fscanf(f, "%255s %40s\n", e->path, e->oid.hash) == 2) {
-            idx->count++;
+        char hash_hex[HASH_HEX_SIZE + 1];
+
+        int ret = fscanf(f, "%o %40s %lu %lu %255[^\n]\n",
+                         &e->mode,
+                         hash_hex,
+                         &e->mtime,
+                         &e->size,
+                         e->path);
+
+        if (ret != 5) break;
+
+        // convert hex → binary hash
+        if (hex_to_hash(hash_hex, &e->hash) != 0) {
+            fclose(f);
+            return -1;
         }
+
+        idx->count++;
     }
 
     fclose(f);
@@ -36,21 +46,29 @@ int index_load(Index *idx) {
 }
 
 /*
- * Save index to file
+ * Save index to .pes/index (atomic write)
  */
 int index_save(const Index *idx) {
-    if (!idx) return -1;
-
-    FILE *f = fopen(INDEX_FILE, "w");
+    FILE *f = fopen(".pes/index.tmp", "w");
     if (!f) return -1;
 
-    for (size_t i = 0; i < idx->count; i++) {
-        fprintf(f, "%s %s\n",
-                idx->entries[i].path,
-                idx->entries[i].oid.hash);
+    for (int i = 0; i < idx->count; i++) {
+        char hex[HASH_HEX_SIZE + 1];
+        hash_to_hex(&idx->entries[i].hash, hex);
+
+        fprintf(f, "%o %s %lu %lu %s\n",
+                idx->entries[i].mode,
+                hex,
+                idx->entries[i].mtime,
+                idx->entries[i].size,
+                idx->entries[i].path);
     }
 
     fclose(f);
+
+    // atomic rename
+    rename(".pes/index.tmp", ".pes/index");
+
     return 0;
 }
 
@@ -58,48 +76,58 @@ int index_save(const Index *idx) {
  * Add file to index
  */
 int index_add(Index *idx, const char *path) {
-    if (!idx || !path) return -1;
+    struct stat st;
 
-    // 1. Read file content
+    if (stat(path, &st) != 0) {
+        return -1;
+    }
+
     FILE *f = fopen(path, "rb");
     if (!f) return -1;
 
-    fseek(f, 0, SEEK_END);
-    long size = ftell(f);
-    rewind(f);
-
-    void *buffer = malloc(size);
+    void *buffer = malloc(st.st_size);
     if (!buffer) {
         fclose(f);
         return -1;
     }
 
-    fread(buffer, 1, size, f);
+    fread(buffer, 1, st.st_size, f);
     fclose(f);
 
-    // 2. Write blob object
+    // write blob object
     ObjectID oid;
-    if (object_write(OBJ_BLOB, buffer, size, &oid) != 0) {
+    if (object_write(OBJ_BLOB, buffer, st.st_size, &oid) != 0) {
         free(buffer);
         return -1;
     }
 
     free(buffer);
 
-    // 3. Check if file already exists → update
-    for (size_t i = 0; i < idx->count; i++) {
+    // check if entry already exists
+    for (int i = 0; i < idx->count; i++) {
         if (strcmp(idx->entries[i].path, path) == 0) {
-            idx->entries[i].oid = oid;
-            return index_save(idx);
+            idx->entries[i].hash = oid;
+            idx->entries[i].mode = get_file_mode(path);
+            idx->entries[i].mtime = st.st_mtime;
+            idx->entries[i].size = st.st_size;
+            return 0;
         }
     }
 
-    // 4. Add new entry
-    IndexEntry *e = &idx->entries[idx->count++];
-    strncpy(e->path, path, sizeof(e->path));
-    e->oid = oid;
+    // add new entry
+    if (idx->count >= MAX_INDEX_ENTRIES) {
+        return -1;
+    }
 
-    // 5. Save index
-    return index_save(idx);
+    IndexEntry *e = &idx->entries[idx->count];
+
+    strcpy(e->path, path);
+    e->hash = oid;
+    e->mode = get_file_mode(path);
+    e->mtime = st.st_mtime;
+    e->size = st.st_size;
+
+    idx->count++;
+
+    return 0;
 }
-```
